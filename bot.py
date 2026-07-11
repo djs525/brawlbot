@@ -9,7 +9,9 @@ import discord
 from discord import app_commands
 
 from agent import answer_question
+import plugins
 
+plugins.load_plugins()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 #Intents = what events Discord will send us. Default is fine for slash commands

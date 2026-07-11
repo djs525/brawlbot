@@ -1,4 +1,9 @@
-"""Gemini tool-use agent over the Brawl Stars data layer."""
+"""Gemini tool-use agent over the Brawl Stars data layer.
+
+Tools are not defined here — they live in the `plugins/` package and are
+discovered at runtime via the plugin registry (plugins.load_plugins() must
+run before the first question, which bot.py does at startup).
+"""
 import asyncio
 import json
 import os
@@ -6,49 +11,23 @@ import os
 from google import genai
 from google.genai import types
 
-import bs_client
-import store
+import plugins
 
 SYSTEM = """You are a Brawl Stars analytics assistant embedded in a Discord bot.
 You answer questions about a player's profile, recent battles, long-term history,
-the current event rotation, and rankings — using tools, never guessing at data.
+the current event rotation, maps, the brawler catalog, and rankings — using
+tools, never guessing at data.
 
 Domain notes:
 - Trophies per brawler; 'trophyChange' is per-battle delta. type=soloRanked is Ranked mode.
 - Showdown results come as rank (1-10 solo, 1-5 duo) instead of victory/defeat.
-- Battlelog covers only ~25 recent battles; use query_history for longer windows
-  (only works if the player is tracked).
+- Battlelog covers only ~25 recent battles; use query_history for longer windows.
 
 The first message contains "asker_tag" — the questioner's own player tag.
 When they say "me"/"my", use that tag.
 
 Be concrete: cite numbers, win rates, trophy deltas. Give actionable advice.
 Keep answers under 1800 characters — this is Discord, not a report."""
-
-TOOLS = types.Tool(function_declarations=[
-    {"name": "get_player",
-     "description": "Full player profile: trophies, brawlers with power/gadgets/star powers/gears, victories, club.",
-     "parameters": {"type": "object", "properties": {"tag": {"type": "string"}}, "required": ["tag"]}},
-    {"name": "get_battlelog",
-     "description": "Last ~25 battles with mode, map, result, trophy change, teams.",
-     "parameters": {"type": "object", "properties": {"tag": {"type": "string"}}, "required": ["tag"]}},
-    {"name": "query_history",
-     "description": "Aggregated stats over N days from stored history: per-brawler/mode/map win rates and trophy deltas. Tracked players only.",
-     "parameters": {"type": "object",
-                    "properties": {"tag": {"type": "string"}, "days": {"type": "integer"}},
-                    "required": ["tag"]}},
-    {"name": "get_events",
-     "description": "Current event rotation: active modes and maps.",
-     "parameters": {"type": "object", "properties": {}}},
-    {"name": "get_brawlers",
-     "description": "Catalog of all brawlers with their star powers and gadgets.",
-     "parameters": {"type": "object", "properties": {}}},
-    {"name": "get_rankings",
-     "description": "Top player or brawler rankings for a country code (or 'global').",
-     "parameters": {"type": "object",
-                    "properties": {"country": {"type": "string"}, "brawler_id": {"type": "integer"}},
-                    "required": []}},
-])
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
@@ -93,49 +72,16 @@ async def _generate(contents, config):
     raise last_err
 
 
-def _fit(obj, limit: int = 40000):
-    """Shrink a tool result so its JSON stays under `limit` chars WITHOUT
-    breaking JSON validity (the old code sliced the serialized string mid-token).
-    Lists get their tail dropped; oversized dicts trim list/dict fields; long
-    strings get clipped."""
-    if len(json.dumps(obj)) <= limit:
-        return obj
-    if isinstance(obj, list):
-        kept = []
-        for item in obj:
-            if len(json.dumps(kept + [item])) > limit:
-                break
-            kept.append(item)
-        kept.append({"_truncated": f"{len(obj) - len(kept)} more items omitted"})
-        return kept
-    if isinstance(obj, dict):
-        d = {k: (_fit(v, limit // 2) if isinstance(v, (list, dict)) else v)
-             for k, v in obj.items()}
-        if len(json.dumps(d)) <= limit:
-            return d
-        return {"_truncated": "payload too large", "keys": list(obj)[:20]}
-    if isinstance(obj, str):
-        return obj[:limit - 20] + "…"
-    return obj
-
-
-async def _execute(name: str, args: dict) -> dict:
-    if name == "get_player":
-        return bs_client.slim_player(await bs_client.get_player(args["tag"]))
-    if name == "get_battlelog":
-        raw = await bs_client.get_battlelog(args["tag"])
-        store.record_battles(args["tag"], raw)  # snapshot for long-window history
-        return bs_client.slim_battlelog(raw)
-    if name == "query_history":
-        return store.query_history(args["tag"], args.get("days", 30))
-    if name == "get_events":
-        return await bs_client.get_events()
-    if name == "get_brawlers":
-        return await bs_client.get_brawlers_slim()
-    if name == "get_rankings":
-        return await bs_client.get_rankings(args.get("country", "global"),
-                                            args.get("brawler_id"))
-    return {"error": f"unknown tool {name}"}
+def _gemini_tool() -> types.Tool:
+    """Build the Gemini tool menu from the plugin registry. Plugins declare
+    their schema under the Anthropic-style `input_schema` key; Gemini wants it
+    under `parameters`, so translate on the way through."""
+    return types.Tool(function_declarations=[
+        {"name": t["name"],
+         "description": t["description"],
+         "parameters": t.get("input_schema") or {"type": "object", "properties": {}}}
+        for t in plugins.all_tools()
+    ])
 
 
 async def answer_question(question: str, asker_tag: str | None,
@@ -147,7 +93,7 @@ async def answer_question(question: str, asker_tag: str | None,
 
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM,
-        tools=[TOOLS],
+        tools=[_gemini_tool()],
         max_output_tokens=3000,
         # we run the loop ourselves for control + async tools:
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
@@ -165,18 +111,12 @@ async def answer_question(question: str, asker_tag: str | None,
         # Run all tool calls in this turn concurrently — a multi-call turn
         # (e.g. get_player + get_battlelog) no longer pays each tool's latency
         # in series. gather preserves order, so parts still line up with calls.
-        async def _run(call):
-            try:
-                return await _execute(call.name, dict(call.args or {}))
-            except Exception as e:
-                return {"error": str(e)}
-
-        results = await asyncio.gather(*(_run(c) for c in calls))
+        # plugins.execute already truncates payloads and wraps its own errors.
+        results = await asyncio.gather(
+            *(plugins.execute(c.name, dict(c.args or {})) for c in calls))
         parts = [
             types.Part.from_function_response(
-                name=call.name,
-                # truncate huge payloads so we stay inside free-tier token limits
-                response={"result": _fit(out)})
+                name=call.name, response={"result": out})
             for call, out in zip(calls, results)
         ]
         contents.append(types.Content(role="user", parts=parts))

@@ -88,6 +88,8 @@ async def _generate(contents, config):
                 raise
             last_err = e
             print(f"[agent] model {model} unavailable ({e}); falling back")
+    if last_err is None:
+        raise RuntimeError("No models configured or all models failed without raising an exception.")
     raise last_err
 
 

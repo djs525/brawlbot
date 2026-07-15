@@ -1,3 +1,4 @@
+import asyncio
 import os
 import store
 from store import normalize_tag
@@ -7,8 +8,11 @@ load_dotenv()  # must run before importing modules that read env at import time
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 
 from agent import answer_question
+import bs_client
+from plugins import history
 import plugins
 
 plugins.load_plugins()
@@ -25,12 +29,46 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)  # holds our slash commands
 store.init()
 
+# How often the poller snapshots each tracked player's battlelog. The official
+# API only keeps ~25 battles, so this must stay well under the time a player
+# could burn through 25 games — 20 min is safe for casual play.
+POLL_MINUTES = 20
+
+
+async def _snapshot(tag: str) -> None:
+    """Record one player's recent battles into history.db. Best-effort — a
+    failure is logged, never raised (used from the poller and from /link)."""
+    try:
+        new = history.record_battles(tag, await bs_client.get_battlelog(tag))
+        if new:
+            print(f"snapshot: {tag} +{new} new battle(s)")
+    except Exception as e:
+        print(f"snapshot: {tag} failed: {type(e).__name__}: {e}")
+
+
+@tasks.loop(minutes=POLL_MINUTES)
+async def poll_history():
+    """Snapshot every tracked player's recent battles into history.db so we can
+    answer longer-window questions than the ~25-battle API log allows. Dedup is
+    handled by record_battles (INSERT OR IGNORE); one bad tag can't kill the loop."""
+    for tag in history.tracked_tags():
+        await _snapshot(tag)
+
+
+@poll_history.before_loop
+async def _before_poll():
+    await client.wait_until_ready()  # don't poll before the gateway is up
+
+
 @client.event
 async def on_ready():
     # Registers our slash commands with Discord. Global sync can take up to
     # an hour to propagate; syncing is instant when scoped to one guild,
     # but global is simpler and fine for us.
     await tree.sync()
+    # on_ready can fire again on reconnect — guard against double-starting.
+    if not poll_history.is_running():
+        poll_history.start()
     print(f"Logged in as {client.user} — bot is live. Ctrl+C to stop.")
 
 
@@ -73,6 +111,9 @@ async def link(interaction: discord.Interaction, tag: str):
         return
 
     store.set_link(str(interaction.user.id), clean)
+    history.track(clean)  # enroll in the background history poller
+    # Seed history now so it doesn't wait up to POLL_MINUTES for the first tick.
+    asyncio.create_task(_snapshot(clean))
     await interaction.response.send_message(
         f"✅ Linked to `{clean}`. Try `/ask what are my best brawlers?`",
         ephemeral=True,

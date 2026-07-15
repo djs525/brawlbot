@@ -22,6 +22,9 @@ Domain notes:
 - Trophies per brawler; 'trophyChange' is per-battle delta. type=soloRanked is Ranked mode.
 - Showdown results come as rank (1-10 solo, 1-5 duo) instead of victory/defeat.
 - Battlelog covers only ~25 recent battles; use query_history for longer windows.
+- get_player returns pre-computed tallies (power11Count, power10Count, brawlerCount).
+  For "how many" questions, report these numbers directly — do NOT hand-count the
+  brawler list, you will miscount it.
 
 The first message contains "asker_tag" — the questioner's own player tag.
 When they say "me"/"my", use that tag.

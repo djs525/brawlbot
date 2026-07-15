@@ -7,31 +7,72 @@ An AI-powered Brawl Stars analyst that lives in your Discord server. Link your p
 ## Features
 
 - **`/link <tag>`** — connect your Brawl Stars player tag to your Discord account
-- **`/ask <question>`** — natural-language questions about your profile, brawlers, battle log, club, and the meta, answered by an LLM agent with live API data
+- **`/ask <question>`** — natural-language questions about your profile, brawlers, battle log, history, event rotation, and rankings, answered by an LLM agent with live API data
 - Trophy, win-rate, and brawler performance analysis from your recent battles
-- Event rotation and map-aware pick suggestions (via Brawlify metadata)
+- Longitudinal history beyond the ~25-battle API window, stored locally in SQLite
+- Event rotation and map-aware pick suggestions (via BrawlAPI/Brawlify metadata)
+- **Plugin architecture** — new data sources are drop-in files; the agent core never changes
+
+## Why this works
+
+The official Supercell API exposes per-player data: full profile, brawler progression (power level, rank, gadgets, star powers, gears), last ~25 battles, club data, event rotation, and regional rankings. That's enough for an LLM agent to answer *personal* questions ("what should I push this season?", "why did I tilt last night?") — not just static meta pages like existing stats sites.
 
 ### Scope note
 
-The official Supercell API is public-profile only: it exposes brawlers, trophies, victories, club, and battle history. It does **not** expose account currencies (Coins, Gems, Power Points, Bling, etc.), so BrawlBot can't show those — no third-party API can, either.
+The official Supercell API is public-profile only. It does **not** expose account currencies (Coins, Gems, Power Points, Bling, Credits, Star Points), because that's account-private economy data Supercell has never exposed for any of their games. No third-party API can show these either — BrawlBot is upfront about this constraint.
 
 ## Architecture
 
-Flat, single-folder layout:
+```
+Discord slash command (/ask)
+        │  defer → followup pattern (beat Discord's 3-second timer)
+        ▼
+  Agent loop (agent.py — Gemini with tool use)
+        │  builds the tool menu from the plugin registry, runs the loop itself
+        ▼
+  plugins/
+  ├── official_bs.py   # Supercell API: get_player, get_battlelog
+  ├── events.py        # event rotation: official first, BrawlAPI fallback
+  ├── brawlapi.py      # BrawlAPI: get_map_details (map images, no key)
+  ├── brawlers.py      # Supercell catalog: get_brawlers
+  ├── rankings.py      # Supercell leaderboards: get_rankings
+  └── history.py       # local longitudinal history: query_history (SQLite)
+        ▼
+  SQLite
+  ├── brawlbot.db (store.py)   # linked tags, tag normalization
+  └── history.db (history.py)  # tracked players + persisted battles
+```
+
+Project layout:
 
 ```
 brawlbot/
-├── bot.py        # Discord client, slash commands (defer → followup pattern)
-├── agent.py      # LLM agent: answers questions using live API data
+├── bot.py        # Discord client, slash commands (defer → followup)
+├── agent.py      # LLM agent loop: source-agnostic, never changes when adding data
+├── plugins/      # each file = one data source exposing TOOLS + async execute()
+├── bs_client.py  # async Supercell API wrapper + slim_* payload trimmers
 ├── store.py      # SQLite storage (linked tags), tag normalization
-├── brawlbot.db   # created automatically on first run
+├── brawlbot.db   # links DB, created automatically on first run
+├── history.db    # tracked players + battle history
 └── .env          # secrets (never commit this)
 ```
 
+### How the agent loop works
+
+1. Build the tool menu by aggregating `TOOLS` from every plugin (`plugins.all_tools()`), translating each plugin's `input_schema` into a Gemini function declaration.
+2. Send Gemini the question plus that menu.
+3. Gemini replies with either **words** (done — return them) or one-or-more **tool calls** (`resp.function_calls`).
+4. Run the calls concurrently via `plugins.execute(...)`, append the results, and call Gemini again.
+5. Repeat until Gemini answers, capped at **8** tool-loop turns to bound cost.
+
+The loop also walks a **model fallback chain** (`agent.MODELS`): on a retryable error (overload, rate-limit, 5xx, quota) it drops to the next, cheaper model instead of failing the request.
+
+`agent.py` contains no URLs, tokens, or source names — adding a data source is just dropping a new file into `plugins/` that exposes `TOOLS` (a list of tool defs) and `async def execute(name, tool_input)`.
+
 Data sources:
-- **Supercell Brawl Stars API** (`api.brawlstars.com`) — live player/club/battle data
-- **Brawlify API** (`api.brawlify.com`) — static metadata: brawler info, event rotations, maps
-- **Anthropic API** — powers the `/ask` agent
+- **Supercell Brawl Stars API** (`api.brawlstars.com/v1`) — live player/club/battle/rankings/brawler data
+- **BrawlAPI / Brawlify** (`api.brawlapi.com/v1`) — static metadata: event rotations, maps (no key required)
+- **Google Gemini API** — powers the `/ask` agent
 
 ## Setup
 
@@ -40,23 +81,23 @@ Requires Python 3.10+.
 ```bash
 git clone <your-repo-url>
 cd brawlbot
-pip install discord.py python-dotenv anthropic requests
+pip install discord.py python-dotenv google-genai aiohttp
 ```
 
 Create a `.env` file:
 
 ```
 DISCORD_TOKEN=your_discord_bot_token
-ANTHROPIC_API_KEY=your_anthropic_key
-BRAWL_API_TOKEN=your_supercell_api_token
+GEMINI_API_KEY=your_gemini_key
+BRAWL_STARS_TOKEN=your_supercell_api_token
 ```
 
 Where to get them:
 - **DISCORD_TOKEN** — [Discord Developer Portal](https://discord.com/developers/applications) → your app → Bot → Reset Token. Also enable the *Message Content* intent.
-- **BRAWL_API_TOKEN** — [developer.brawlstars.com](https://developer.brawlstars.com) (tokens are IP-locked; create a new one if your IP changes)
-- **ANTHROPIC_API_KEY** — [console.anthropic.com](https://console.anthropic.com)
+- **BRAWL_STARS_TOKEN** — [developer.brawlstars.com](https://developer.brawlstars.com). Tokens are **IP-locked** — create a new one if your IP changes. On serverless/dynamic-IP hosts, use a static-egress proxy (e.g. `bsproxy.royaleapi.dev`).
+- **GEMINI_API_KEY** — [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
 
-Add `.env` and `brawlbot.db` to `.gitignore` before your first commit.
+Add `.env`, `brawlbot.db`, and `history.db` to `.gitignore` before your first commit.
 
 ## Run
 
@@ -64,23 +105,43 @@ Add `.env` and `brawlbot.db` to `.gitignore` before your first commit.
 python bot.py
 ```
 
-On startup the bot syncs its slash commands (global sync can take up to an hour to propagate the first time). Then in Discord:
+On startup you should see the plugins load, e.g. `plugins: loaded 'official_bs' with 2 tool(s)`. New slash commands sync in `on_ready`, so adding a command requires a restart.
+
+Then in Discord:
 
 ```
 /link #YOURTAG
+/ask what are my best brawlers?
 /ask what should I push on today's maps?
+/ask how's my win rate in showdown this month?
 ```
 
-## Notes for contributors
+## Implementation notes & gotchas
 
-- Slash command handlers must `await interaction.response.defer()` within 3 seconds, then reply with `interaction.followup.send(...)`. The agent takes 10–20s, so this is non-negotiable.
-- Replies are chunked to respect Discord's 2000-character message cap.
-- `discord.NotFound` (error 10062) on defer means the interaction token expired before the ACK — the handler drops it gracefully.
-- New slash commands require a bot restart (sync runs in `on_ready`).
+- **Discord's 3-second rule** — slash commands must be acknowledged within 3 seconds or Discord shows "The application did not respond." The agent takes 10–20s, so every command uses `await interaction.response.defer()` then `await interaction.followup.send(...)` (15-minute window).
+- **Always send a followup** — after a `defer()`, a crash with no followup leaves the user staring at "thinking…" forever; agent calls are wrapped in try/except.
+- **2000-character cap** — Discord hard-rejects longer messages; `bot._chunk` splits answers on line boundaries into ≤2000-char messages.
+- **Env-load order** — `load_dotenv()` must run before `plugins.load_plugins()` in `bot.py`, since plugins read `os.environ` at import time. Tools are also built at *call* time, not import time, because `agent` is imported before the registry is loaded.
+- **Payload trimming** — `bs_client.slim_*` helpers cut fat API payloads down to what the LLM needs; plugins additionally cap raw responses at 12000 chars to stay inside free-tier token limits.
+- **Showdown scoring** — showdown reports placement, not victory/defeat. `history.py` scores solo (top 4) and duo/trio (top 2) as wins when aggregating win rates.
+- **Battle log retention** — the API only keeps ~25 battles. A background poller (`bot.poll_history`, every 20 min) snapshots every tracked player's battlelog into `history.db`, so longer windows can be queried. Players are enrolled by `/link` (`history.track`); `query_history` also records the caller's battles on demand. `record_battles` dedupes on `(tag, battle_time)`, so overlapping snapshots are harmless.
 
 ## Roadmap
 
-- Trophy progression tracking over time (snapshot history in the DB)
-- Club activity monitoring and rank-up notifications
-- Plugin system (`plugins/` subfolder) for per-feature modules
-- Thread-based conversations for follow-up questions
+- [x] **Phase 0** — bot skeleton, `/ping`
+- [x] **Phase 1** — `/ask` wired to the agent (defer → followup)
+- [x] **Phase 2** — plugin registry; BrawlAPI plugin (event rotation, maps)
+- [x] **Phase 3** — `/link` tag storage (SQLite); brawler/rankings/history plugins; long-answer splitting
+- [x] **Phase 4** — longitudinal history
+  - [x] persist battles to SQLite + `query_history` aggregation
+  - [x] background poller (`bot.poll_history`, every 20 min) snapshots **all tracked** tags
+  - [x] auto-track on `/link` (`history.track`) to seed the tracked set
+  - _rate limiting / cost caps intentionally skipped — small trusted server on the owner's key_
+- [x] **Cleanup** — `official_bs.py` folded onto `bs_client` (single Supercell token, shared slimming)
+- [ ] **Phase 5** — conversational threads
+  - [ ] multi-turn follow-ups in a Discord thread (agent is stateless today)
+  - [ ] rich embeds for structured output
+
+## License
+
+MIT (or your choice). Fan-made project; all Brawl Stars content and materials are trademarks and copyrights of Supercell.

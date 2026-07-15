@@ -72,6 +72,20 @@ def _player_brawler(battle: dict, tag: str) -> str | None:
     return None
 
 
+def track(tag: str) -> None:
+    """Add a tag to the tracked set so the background poller snapshots it.
+    Idempotent — re-tracking an existing tag is a no-op."""
+    with _conn() as c:
+        c.execute("INSERT OR IGNORE INTO tracked (tag, added_at) VALUES (?, ?)",
+                  (_norm(tag), datetime.now(timezone.utc).strftime(_TIME_FMT)))
+
+
+def tracked_tags() -> list[str]:
+    """Every tag the poller should snapshot."""
+    with _conn() as c:
+        return [r[0] for r in c.execute("SELECT tag FROM tracked")]
+
+
 def record_battles(tag: str, battlelog: dict) -> int:
     """Upsert a raw battlelog (bs_client.get_battlelog output) into history.
     Returns the number of newly stored battles."""

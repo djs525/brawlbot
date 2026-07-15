@@ -101,6 +101,11 @@ def slim_player(data: dict) -> dict:
     brawlers = sorted(data.get("brawlers", []),
                       key=lambda b: b.get("trophies", 0), reverse=True)
 
+    # Pre-computed tallies so the model reports exact numbers instead of
+    # hand-counting a ~90-item list (LLMs undercount long lists).
+    power11_count = sum(1 for b in brawlers if b.get("power") == 11)
+    power10_count = sum(1 for b in brawlers if b.get("power") == 10)
+
     def entry(b, detailed):
         e = {"name": b.get("name"), "power": b.get("power"),
              "trophies": b.get("trophies"),
@@ -122,6 +127,8 @@ def slim_player(data: dict) -> dict:
         "duoVictories": data.get("duoVictories"),
         "club": (data.get("club") or {}).get("name"),
         "brawlerCount": len(data.get("brawlers", [])),
+        "power11Count": power11_count,
+        "power10Count": power10_count,
         # Detail note so the model knows the tail isn't missing gear data by
         # accident — it can ask for a specific brawler if a user needs it.
         "loadoutDetailFor": f"top {DETAILED_BRAWLERS} by trophies; rest show core stats only",

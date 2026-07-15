@@ -1,12 +1,13 @@
-"""Plugin: official Supercell Brawl Stars API (live player data)."""
+"""Plugin: official Supercell Brawl Stars API — player profile + battle log.
 
-import os
+Thin adapter over bs_client, which owns the HTTP/auth (single BRAWL_STARS_TOKEN)
+and the slim_* payload trimmers. This file used to duplicate bs_client with its
+own BRAWL_API_TOKEN and no slimming — that token is gone now.
+"""
+
 import json
-import urllib.parse
-import aiohttp
 
-BASE = "https://api.brawlstars.com/v1"
-TOKEN = os.environ["BRAWL_API_TOKEN"]
+import bs_client
 
 TOOLS = [
     {
@@ -40,27 +41,16 @@ TOOLS = [
             "required": ["tag"],
         },
     },
-    # ...add entries for any other Supercell tools you already had
 ]
-
-
-async def _api_get(path: str) -> str:
-    headers = {"Authorization": f"Bearer {TOKEN}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(f"{BASE}{path}", headers=headers) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-    return json.dumps(data)[:12000]
-
-
-def _encode_tag(tag: str) -> str:
-    # '#' is special in URLs, so #ABC123 must become %23ABC123
-    return urllib.parse.quote(tag, safe="")
 
 
 async def execute(name: str, tool_input: dict) -> str:
     if name == "get_player":
-        return await _api_get(f"/players/{_encode_tag(tool_input['tag'])}")
+        data = await bs_client.get_player(tool_input["tag"])
+        # slim_player is already size-bounded (full roster ~20k chars); a 12k
+        # slice here would chop the tail brawlers and undercount the roster.
+        return json.dumps(bs_client.slim_player(data))[:40000]
     if name == "get_battlelog":
-        return await _api_get(f"/players/{_encode_tag(tool_input['tag'])}/battlelog")
+        raw = await bs_client.get_battlelog(tool_input["tag"])
+        return json.dumps(bs_client.slim_battlelog(raw))[:12000]
     return f"ERROR: official_bs got unknown tool '{name}'"

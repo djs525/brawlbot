@@ -1,8 +1,8 @@
 """Plugin: leaderboards (official Supercell API, via bs_client)."""
 
-import json
-
 import bs_client
+
+from . import jsonout
 
 TOOLS = [
     {
@@ -37,5 +37,5 @@ async def execute(name: str, tool_input: dict) -> str:
             tool_input.get("country", "global"),
             tool_input.get("brawler_id"),
         )
-        return json.dumps(data)[:12000]
+        return jsonout.dump(data)
     return f"ERROR: rankings got unknown tool '{name}'"

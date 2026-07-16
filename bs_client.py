@@ -20,12 +20,15 @@ class BrawlStarsError(RuntimeError):
     """Raised when the API returns a non-200 response."""
 
 
+def _plain_tag(tag: str) -> str:
+    """Uppercase, ensure leading #. For comparing tags, not for URLs."""
+    tag = (tag or "").strip().upper()
+    return tag if tag.startswith("#") else "#" + tag
+
+
 def _norm_tag(tag: str) -> str:
     """Uppercase, ensure leading #, URL-encode (# -> %23) for the path."""
-    tag = tag.strip().upper()
-    if not tag.startswith("#"):
-        tag = "#" + tag
-    return quote(tag, safe="")
+    return quote(_plain_tag(tag), safe="")
 
 
 async def _get(path: str) -> dict:
@@ -82,21 +85,17 @@ async def get_rankings(country: str = "global", brawler_id: int | None = None) -
 
 # ------------------------------------------------------------------ slimmers
 
-# How many top-trophy brawlers get full loadout detail. Set to cover the whole
-# roster so upgrade/resource-allocation advice sees every brawler's gadgets,
-# star powers and gears — not just the high-trophy ones. Heavier per tool-loop
-# turn, but the full payload still fits under the caller's _fit limit.
-# NOTE: this is a count, not "all" — if Supercell ships more than this many
-# brawlers, the excess would drop to core-stats-only. Bump it when that happens.
-DETAILED_BRAWLERS = 104
-
 def slim_player(data: dict) -> dict:
     """Profile + the player's COMPLETE brawler roster, sorted by trophies desc.
 
-    Every brawler is included, so "brawlers below 1000 trophies" or "which
-    Power 11s haven't I pushed" answer accurately. To keep the payload light,
-    only the top DETAILED_BRAWLERS carry gadgets/starpowers/gears; the tail
-    carries core stats (name/power/trophies) — visible, just not detailed.
+    Every brawler is included with its full loadout, so "brawlers below 1000
+    trophies", "which Power 11s haven't I pushed", and gear/upgrade advice all
+    see the real roster. A full 106-brawler profile is ~20k chars, well inside
+    the 40k ceiling get_player serializes under.
+
+    This used to detail only the top N by trophies (N=104), which silently
+    demoted the tail to core-stats-only as Supercell shipped new brawlers —
+    a constant that had to be hand-bumped every update or quietly go stale.
     """
     brawlers = sorted(data.get("brawlers", []),
                       key=lambda b: b.get("trophies", 0), reverse=True)
@@ -106,15 +105,13 @@ def slim_player(data: dict) -> dict:
     power11_count = sum(1 for b in brawlers if b.get("power") == 11)
     power10_count = sum(1 for b in brawlers if b.get("power") == 10)
 
-    def entry(b, detailed):
-        e = {"name": b.get("name"), "power": b.get("power"),
-             "trophies": b.get("trophies"),
-             "highestTrophies": b.get("highestTrophies")}
-        if detailed:
-            e["gadgets"] = [g["name"] for g in b.get("gadgets", [])]
-            e["starPowers"] = [s["name"] for s in b.get("starPowers", [])]
-            e["gears"] = [g["name"] for g in b.get("gears", [])]
-        return e
+    def entry(b):
+        return {"name": b.get("name"), "power": b.get("power"),
+                "trophies": b.get("trophies"),
+                "highestTrophies": b.get("highestTrophies"),
+                "gadgets": [g["name"] for g in b.get("gadgets", [])],
+                "starPowers": [s["name"] for s in b.get("starPowers", [])],
+                "gears": [g["name"] for g in b.get("gears", [])]}
 
     return {
         "name": data.get("name"),
@@ -129,15 +126,83 @@ def slim_player(data: dict) -> dict:
         "brawlerCount": len(data.get("brawlers", [])),
         "power11Count": power11_count,
         "power10Count": power10_count,
-        # Detail note so the model knows the tail isn't missing gear data by
-        # accident — it can ask for a specific brawler if a user needs it.
-        "loadoutDetailFor": f"top {DETAILED_BRAWLERS} by trophies; rest show core stats only",
-        "brawlers": [entry(b, i < DETAILED_BRAWLERS)
-                     for i, b in enumerate(brawlers)],
+        "brawlers": [entry(b) for b in brawlers],
     }
 
 
-def slim_battlelog(data: dict) -> list[dict]:
+def player_brawler(battle: dict, tag: str) -> str | None:
+    """Find which brawler `tag` played in one battle. Players live either in a
+    flat `players` list (showdown) or nested in `teams` (3v3/duo)."""
+    want = _plain_tag(tag)
+    groups = battle.get("teams") or [battle.get("players", [])]
+    for group in groups:
+        for player in group:
+            if _plain_tag(player.get("tag", "")) == want:
+                return (player.get("brawler") or {}).get("name")
+    return None
+
+
+def _rate(wins: int, total: int) -> float:
+    return round(100 * wins / total, 1) if total else 0.0
+
+
+def outcome(mode: str | None, result: str | None, rank: int | None) -> str | None:
+    """Normalize a battle to "win"/"loss"/None(draw/unknown).
+
+    Team modes report result directly. Showdown reports placement instead:
+    solo (10 players) top 4 is a win; duo/trio (5 teams) top 2 is a win."""
+    if result == "victory":
+        return "win"
+    if result == "defeat":
+        return "loss"
+    if result == "draw":
+        return None
+    if rank is not None:  # showdown placement
+        win_cutoff = 4 if "solo" in (mode or "").lower() else 2
+        return "win" if rank <= win_cutoff else "loss"
+    return None
+
+
+def summarize_battles(battles: list[dict]) -> dict:
+    """Pre-computed overall / per-mode / per-brawler tallies over a battle list.
+
+    Same reason slim_player ships power11Count: the model mis-aggregates a
+    25-row list by hand (it merged soloShowdown into duoShowdown on a shared
+    map). Each battle is a dict with mode/brawler/result/rank/trophyChange.
+    """
+    def bucket():
+        return {"battles": 0, "wins": 0, "losses": 0, "trophyChange": 0}
+
+    overall = bucket()
+    per_mode: dict[str, dict] = {}
+    per_brawler: dict[str, dict] = {}
+
+    for b in battles:
+        mode = b.get("mode")
+        result = outcome(mode, b.get("result"), b.get("rank"))
+        for acc in (overall,
+                    per_mode.setdefault(mode or "unknown", bucket()),
+                    per_brawler.setdefault(b.get("brawler") or "unknown", bucket())):
+            acc["battles"] += 1
+            acc["trophyChange"] += b.get("trophyChange") or 0
+            if result == "win":
+                acc["wins"] += 1
+            elif result == "loss":
+                acc["losses"] += 1
+
+    def finalize(b):
+        b["winRate"] = _rate(b["wins"], b["battles"])
+        return b
+
+    return {"overall": finalize(overall),
+            "perMode": {k: finalize(v) for k, v in per_mode.items()},
+            "perBrawler": {k: finalize(v) for k, v in per_brawler.items()}}
+
+
+def slim_battlelog(data: dict, tag: str) -> list[dict]:
+    """Trim a battlelog to what the model needs. `tag` identifies which player
+    in each battle is 'us' — without it the brawler column can't be resolved
+    and per-brawler questions get answered from thin air."""
     out = []
     for item in data.get("items", []):
         b = item.get("battle", {})
@@ -147,6 +212,7 @@ def slim_battlelog(data: dict) -> list[dict]:
             "mode": b.get("mode") or ev.get("mode"),
             "map": ev.get("map"),
             "type": b.get("type"),
+            "brawler": player_brawler(b, tag),  # brawler THIS player used
             "result": b.get("result"),        # victory/defeat/draw (3v3 etc.)
             "rank": b.get("rank"),            # showdown placement
             "trophyChange": b.get("trophyChange"),

@@ -6,11 +6,11 @@ a fallback — it intermittently returns empty active/upcoming lists, which is w
 made the bot say "no event data".
 """
 
-import json
-
 import aiohttp
 
 import bs_client
+
+from . import jsonout
 
 BRAWLAPI_EVENTS = "https://api.brawlapi.com/v1/events"
 
@@ -47,7 +47,7 @@ async def execute(name: str, tool_input: dict) -> str:
         print(f"[events] official rotation failed, trying BrawlAPI: {e}")
 
     if slots:
-        return json.dumps({"source": "official", "rotation": slots})[:12000]
+        return jsonout.dump({"source": "official", "rotation": slots})
 
     # Fallback: BrawlAPI community feed (may itself be empty).
     try:
@@ -56,4 +56,4 @@ async def execute(name: str, tool_input: dict) -> str:
         return f"ERROR: no event rotation available (official empty, BrawlAPI failed: {e})"
     if not (data.get("active") or data.get("upcoming")):
         return "ERROR: event rotation is currently empty from both sources — try again shortly."
-    return json.dumps({"source": "brawlapi", **data})[:12000]
+    return jsonout.dump({"source": "brawlapi", **data})

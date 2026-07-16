@@ -60,18 +60,6 @@ def _conn():
     return sqlite3.connect(DB_PATH)
 
 
-def _player_brawler(battle: dict, tag: str) -> str | None:
-    """Find which brawler `tag` played in one battle. Players live either in a
-    flat `players` list (showdown) or nested in `teams` (3v3/duo)."""
-    tag = _norm(tag)
-    groups = battle.get("teams") or [battle.get("players", [])]
-    for group in groups:
-        for player in group:
-            if _norm(player.get("tag", "")) == tag:
-                return (player.get("brawler") or {}).get("name")
-    return None
-
-
 def track(tag: str) -> None:
     """Add a tag to the tracked set so the background poller snapshots it.
     Idempotent — re-tracking an existing tag is a no-op."""
@@ -99,7 +87,7 @@ def record_battles(tag: str, battlelog: dict) -> int:
             item.get("battleTime"),
             b.get("mode") or ev.get("mode"),
             ev.get("map"),
-            _player_brawler(b, tag),
+            bs_client.player_brawler(b, tag),
             b.get("result"),
             b.get("rank"),
             b.get("trophyChange"),
@@ -119,27 +107,6 @@ def record_battles(tag: str, battlelog: dict) -> int:
         return c.total_changes - before
 
 
-def _rate(wins: int, total: int) -> float:
-    return round(100 * wins / total, 1) if total else 0.0
-
-
-def _outcome(mode: str | None, result: str | None, rank: int | None) -> str | None:
-    """Normalize a battle to "win"/"loss"/None(draw/unknown).
-
-    Team modes report result directly. Showdown reports placement instead:
-    solo (10 players) top 4 is a win; duo/trio (5 teams) top 2 is a win."""
-    if result == "victory":
-        return "win"
-    if result == "defeat":
-        return "loss"
-    if result == "draw":
-        return None
-    if rank is not None:  # showdown placement
-        win_cutoff = 4 if "solo" in (mode or "").lower() else 2
-        return "win" if rank <= win_cutoff else "loss"
-    return None
-
-
 def query_history(tag: str, days: int = 30) -> dict:
     tag = _norm(tag)
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(_TIME_FMT)
@@ -155,37 +122,13 @@ def query_history(tag: str, days: int = 30) -> dict:
                 "note": "No stored history in this window yet — history builds "
                         "up as this player is queried over time."}
 
-    def bucket():
-        return {"battles": 0, "wins": 0, "losses": 0, "trophyChange": 0}
-
-    overall = bucket()
-    per_mode: dict[str, dict] = {}
-    per_brawler: dict[str, dict] = {}
-
-    for mode, brawler, result, rank, trophy in rows:
-        outcome = _outcome(mode, result, rank)  # "win" / "loss" / None (draw)
-        for b in (overall,
-                  per_mode.setdefault(mode or "unknown", bucket()),
-                  per_brawler.setdefault(brawler or "unknown", bucket())):
-            b["battles"] += 1
-            b["trophyChange"] += trophy or 0
-            if outcome == "win":
-                b["wins"] += 1
-            elif outcome == "loss":
-                b["losses"] += 1
-
-    def finalize(b):
-        b["winRate"] = _rate(b["wins"], b["battles"])
-        return b
-
-    return {
-        "tag": tag,
-        "days": days,
-        "battles": overall["battles"],
-        "overall": finalize(overall),
-        "perMode": {k: finalize(v) for k, v in per_mode.items()},
-        "perBrawler": {k: finalize(v) for k, v in per_brawler.items()},
-    }
+    summary = bs_client.summarize_battles([
+        {"mode": mode, "brawler": brawler, "result": result,
+         "rank": rank, "trophyChange": trophy}
+        for mode, brawler, result, rank, trophy in rows
+    ])
+    return {"tag": tag, "days": days,
+            "battles": summary["overall"]["battles"], **summary}
 
 
 async def execute(name: str, tool_input: dict) -> str:

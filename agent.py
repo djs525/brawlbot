@@ -25,6 +25,12 @@ Domain notes:
 - get_player returns pre-computed tallies (power11Count, power10Count, brawlerCount).
   For "how many" questions, report these numbers directly — do NOT hand-count the
   brawler list, you will miscount it.
+- get_battlelog and query_history both return a pre-computed summary with
+  overall/perMode/perBrawler tallies (battles, wins, losses, trophyChange,
+  winRate). For "how did I do on X" / "breakdown by brawler or mode" questions,
+  report those numbers directly — do NOT re-aggregate the battle list by hand.
+- Each battle's "brawler" field is the brawler THIS player used. Never infer or
+  guess a brawler; if the field is absent, say so rather than naming one.
 
 The first message contains "asker_tag" — the questioner's own player tag.
 When they say "me"/"my", use that tag.

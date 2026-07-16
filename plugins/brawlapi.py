@@ -1,9 +1,10 @@
 """Plugin: BrawlAPI (brawlapi.com) — event rotation, maps, images. No key needed."""
 
-import json
 import time
 
 import aiohttp
+
+from . import jsonout
 
 BASE = "https://api.brawlapi.com/v1"
 
@@ -156,7 +157,7 @@ async def execute(name: str, tool_input: dict) -> str:
         return "ERROR: get_map_details needs a map_name or map_id."
 
     data = await _get_json(f"/maps/{map_id}")
-    return json.dumps(_slim(data))[:12000]
+    return jsonout.dump(_slim(data))
 
 
 async def _execute_brawler(tool_input: dict) -> str:
@@ -167,9 +168,9 @@ async def _execute_brawler(tool_input: dict) -> str:
     # No selector -> compact roster of name -> archetype so the model can scan
     # every brawler's role in one shot without pulling full loadouts.
     if brawler_id is None and not brawler_name:
-        return json.dumps([{"name": b.get("name"),
-                            "archetype": (b.get("class") or {}).get("name")}
-                           for b in roster])
+        return jsonout.dump([{"name": b.get("name"),
+                              "archetype": (b.get("class") or {}).get("name")}
+                             for b in roster])
 
     if brawler_id is not None:
         hit = next((b for b in roster if b.get("id") == brawler_id), None)
@@ -181,4 +182,4 @@ async def _execute_brawler(tool_input: dict) -> str:
     if hit is None:
         who = brawler_name if brawler_name else brawler_id
         return f"ERROR: no brawler '{who}' found in the BrawlAPI catalog."
-    return json.dumps(_slim_brawler(hit))[:12000]
+    return jsonout.dump(_slim_brawler(hit))

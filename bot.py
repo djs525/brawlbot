@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from agent import answer_question
+from agent import answer_question, Answer
 import bs_client
 from plugins import history
 import plugins
@@ -94,10 +94,11 @@ async def ask(interaction: discord.Interaction, question: str):
         answer = await answer_question(question, asker_tag=asker_tag)
     except Exception as e:
         print(f"ask: answer_question failed: {type(e).__name__}: {e}")
-        answer = f"Something broke on my end: `{type(e).__name__}`. Try again?"
+        answer = Answer(summary=f"Something broke on my end: "
+                                f"`{type(e).__name__}`. Try again?",
+                        color="#e84d4d")
     try:
-        for chunk in _chunk(answer):
-            await interaction.followup.send(chunk)
+        await _send_answer(interaction, answer)
     except discord.HTTPException as e:
         print(f"ask: failed to send followup: {e}")
 
@@ -118,6 +119,54 @@ async def link(interaction: discord.Interaction, tag: str):
         f"✅ Linked to `{clean}`. Try `/ask what are my best brawlers?`",
         ephemeral=True,
     )
+
+DEFAULT_COLOR = 0x4DA3FF  # neutral blue accent when the model gives no color
+
+
+def _parse_color(hex_str: str | None) -> int:
+    """'#f5c518' -> 0xf5c518. Bad/missing values fall back to the brand blue."""
+    if not hex_str:
+        return DEFAULT_COLOR
+    try:
+        return int(hex_str.strip().lstrip("#"), 16)
+    except ValueError:
+        return DEFAULT_COLOR
+
+
+def _build_embed(ans: Answer) -> discord.Embed:
+    """Turn an Answer into a Discord embed. Description caps at 4096; the tail,
+    if any, is returned to the caller to send as plain follow-ups."""
+    embed = discord.Embed(
+        title=ans.title or None,
+        description=(ans.summary.strip() or "(empty answer)")[:4096],
+        color=_parse_color(ans.color),
+    )
+    for f in ans.fields:
+        embed.add_field(name=f["name"], value=f["value"], inline=f["inline"])
+    if ans.image_url:
+        embed.set_image(url=ans.image_url)
+    if ans.thumbnail_url:
+        embed.set_thumbnail(url=ans.thumbnail_url)
+    embed.set_footer(text="BrawlBot • not affiliated with Supercell")
+    return embed
+
+
+async def _send_answer(interaction: discord.Interaction, ans: Answer) -> None:
+    """Send an Answer as a rich embed, spilling any over-4096-char summary tail
+    into plain follow-ups. If Discord rejects the embed (e.g. total size over
+    its 6000-char ceiling), fall back to plain-text chunks so the user still
+    gets the answer instead of nothing."""
+    try:
+        await interaction.followup.send(embed=_build_embed(ans))
+        overflow = (ans.summary.strip() or "")[4096:]
+        if overflow.strip():
+            for chunk in _chunk(overflow):
+                await interaction.followup.send(chunk)
+    except discord.HTTPException as e:
+        print(f"ask: embed rejected ({e}); falling back to plain text.")
+        for chunk in _chunk(ans.summary):
+            await interaction.followup.send(chunk)
+
 
 def _chunk(text: str, limit: int = 2000):
     """Split a reply into <=limit-char messages on line boundaries, so long

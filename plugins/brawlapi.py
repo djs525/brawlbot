@@ -120,6 +120,8 @@ def _slim_brawler(b: dict) -> dict:
         "archetype": (b.get("class") or {}).get("name"),
         "rarity": (b.get("rarity") or {}).get("name"),
         "description": b.get("description"),
+        # Portrait for present_answer's thumbnail_url on single-brawler answers.
+        "imageUrl": b.get("imageUrl"),
         "starPowers": loadout(b.get("starPowers")),
         "gadgets": loadout(b.get("gadgets")),
     }

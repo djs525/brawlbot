@@ -7,11 +7,29 @@ run before the first question, which bot.py does at startup).
 import asyncio
 import json
 import os
+from dataclasses import dataclass, field
 
 from google import genai
 from google.genai import types
 
 import plugins
+
+
+@dataclass
+class Answer:
+    """Structured result the bot renders as a Discord embed.
+
+    Only `summary` is required; everything else is optional decoration. When the
+    model finishes with plain prose instead of calling present_answer, we wrap
+    that text as `summary` and leave the rest empty — the embed degrades to a
+    plain description, so nothing downstream has to special-case it.
+    """
+    summary: str
+    title: str | None = None
+    fields: list[dict] = field(default_factory=list)
+    image_url: str | None = None      # big banner image (maps)
+    thumbnail_url: str | None = None  # small corner image (player icon / brawler)
+    color: str | None = None          # hex like "#00b0f4"
 
 SYSTEM = """You are a Brawl Stars analytics assistant embedded in a Discord bot.
 You answer questions about a player's profile, recent battles, long-term history,
@@ -36,7 +54,23 @@ The first message contains "asker_tag" — the questioner's own player tag.
 When they say "me"/"my", use that tag.
 
 Be concrete: cite numbers, win rates, trophy deltas. Give actionable advice.
-Keep answers under 1800 characters — this is Discord, not a report."""
+Keep answers under 1800 characters — this is Discord, not a report.
+
+OUTPUT FORMAT — always finish by calling the `present_answer` tool (call it
+alone, as your final step, after you have gathered all the data you need). This
+renders a rich Discord embed. Guidelines:
+- `summary`: your prose answer (<1800 chars). Numbers and advice go here.
+- `title`: a short headline for the card, e.g. "Your Showdown — Last 30 Days".
+- `fields`: use for stat breakdowns — one field per mode/brawler/metric with a
+  short `name` and a compact `value`. Set `inline: true` on short stat fields so
+  they sit side by side. Prefer fields over a wall of bullet points in summary.
+- `image_url`: a large banner image. Set it to a map's `imageUrl` when the answer
+  is about a specific map or the event rotation.
+- `thumbnail_url`: a small corner image. Use the player's `iconUrl` for profile
+  answers, or a brawler's `imageUrl` when the answer is about one brawler.
+- Only ever use image URLs that appeared in tool results — never invent one.
+- `color`: optional hex accent, e.g. "#f5c518" for trophies, "#e84d4d" for
+  warnings/tilt, "#4da3ff" for neutral info."""
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
@@ -81,20 +115,91 @@ async def _generate(contents, config):
     raise last_err
 
 
+# Terminal presentation tool. It is NOT a plugin — it fetches nothing. When the
+# model calls it, the loop intercepts the args and turns them into an Answer /
+# Discord embed, then stops. Keeping it here (not in plugins/) means it never
+# hits plugins.execute and the plugin layer stays purely about data sources.
+PRESENT_TOOL = {
+    "name": "present_answer",
+    "description": (
+        "Render the FINAL answer as a rich Discord embed. Call this once, alone, "
+        "as your last step. This ends the turn — do not call any data tool in the "
+        "same step."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string",
+                        "description": "The prose answer (<1800 chars)."},
+            "title": {"type": "string", "description": "Short headline for the card."},
+            "fields": {
+                "type": "array",
+                "description": "Stat rows. Prefer these over bullet lists.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Short label."},
+                        "value": {"type": "string", "description": "Compact value."},
+                        "inline": {"type": "boolean",
+                                   "description": "true = sit side by side."},
+                    },
+                    "required": ["name", "value"],
+                },
+            },
+            "image_url": {"type": "string",
+                          "description": "Large banner image (a map's imageUrl)."},
+            "thumbnail_url": {"type": "string",
+                              "description": "Small corner image (player iconUrl or "
+                                             "brawler imageUrl)."},
+            "color": {"type": "string", "description": "Hex accent, e.g. '#f5c518'."},
+        },
+        "required": ["summary"],
+    },
+}
+
+
+def _valid_url(u) -> str | None:
+    """Only pass through real http(s) URLs — Discord rejects anything else, and
+    the model occasionally hallucinates a bare filename or empty string."""
+    return u if isinstance(u, str) and u.startswith(("http://", "https://")) else None
+
+
+def _build_answer(args: dict) -> Answer:
+    """Coerce present_answer's raw tool args into a validated Answer."""
+    raw_fields = args.get("fields") or []
+    fields = [
+        {"name": str(f["name"])[:256],
+         "value": str(f["value"])[:1024],
+         "inline": bool(f.get("inline", False))}
+        for f in raw_fields
+        if isinstance(f, dict) and f.get("name") and f.get("value")
+    ][:25]  # Discord caps an embed at 25 fields
+    return Answer(
+        summary=str(args.get("summary") or "").strip()
+        or "I couldn't produce an answer — try rephrasing.",
+        title=(str(args["title"])[:256] if args.get("title") else None),
+        fields=fields,
+        image_url=_valid_url(args.get("image_url")),
+        thumbnail_url=_valid_url(args.get("thumbnail_url")),
+        color=(str(args["color"]) if args.get("color") else None),
+    )
+
+
 def _gemini_tool() -> types.Tool:
-    """Build the Gemini tool menu from the plugin registry. Plugins declare
-    their schema under the Anthropic-style `input_schema` key; Gemini wants it
-    under `parameters`, so translate on the way through."""
+    """Build the Gemini tool menu from the plugin registry plus the terminal
+    present_answer tool. Plugins declare their schema under the Anthropic-style
+    `input_schema` key; Gemini wants it under `parameters`, so translate on the
+    way through."""
     return types.Tool(function_declarations=[
         {"name": t["name"],
          "description": t["description"],
          "parameters": t.get("input_schema") or {"type": "object", "properties": {}}}
-        for t in plugins.all_tools()
+        for t in [*plugins.all_tools(), PRESENT_TOOL]
     ])
 
 
 async def answer_question(question: str, asker_tag: str | None,
-                          mentioned: dict[str, str] | None = None) -> str:
+                          mentioned: dict[str, str] | None = None) -> Answer:
     context = {"asker_tag": asker_tag or "NOT LINKED",
                "mentioned_players": mentioned or {}}
     contents = [types.Content(role="user", parts=[
@@ -112,8 +217,19 @@ async def answer_question(question: str, asker_tag: str | None,
         resp = await _generate(contents, config)
 
         calls = resp.function_calls or []
+
+        # Terminal presentation tool: if the model asked to present, build the
+        # embed from its args and stop. It fetches no data, so it never routes
+        # to plugins.execute; any sibling calls in the same turn are ignored
+        # (the prompt tells the model to call present_answer alone).
+        present = next((c for c in calls if c.name == "present_answer"), None)
+        if present is not None:
+            return _build_answer(dict(present.args or {}))
+
         if not calls:
-            return resp.text or "I couldn't produce an answer — try rephrasing."
+            # Model finished with plain prose instead of present_answer — wrap it.
+            return Answer(summary=resp.text
+                          or "I couldn't produce an answer — try rephrasing.")
 
         contents.append(resp.candidates[0].content)  # the model's tool-call turn
 
@@ -130,4 +246,4 @@ async def answer_question(question: str, asker_tag: str | None,
         ]
         contents.append(types.Content(role="user", parts=parts))
 
-    return "I got lost in the data — try a more specific question."
+    return Answer(summary="I got lost in the data — try a more specific question.")

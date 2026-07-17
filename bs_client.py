@@ -113,9 +113,17 @@ def slim_player(data: dict) -> dict:
                 "starPowers": [s["name"] for s in b.get("starPowers", [])],
                 "gears": [g["name"] for g in b.get("gears", [])]}
 
+    # Profile icon as a renderable URL (Brawlify CDN). The API only gives the
+    # numeric icon id; the model can hand this straight to present_answer's
+    # thumbnail_url for profile answers.
+    icon_id = (data.get("icon") or {}).get("id")
+    icon_url = (f"https://cdn.brawlify.com/profile-icons/regular/{icon_id}.png"
+                if icon_id else None)
+
     return {
         "name": data.get("name"),
         "tag": data.get("tag"),
+        "iconUrl": icon_url,
         "trophies": data.get("trophies"),
         "highestTrophies": data.get("highestTrophies"),
         "expLevel": data.get("expLevel"),

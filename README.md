@@ -138,9 +138,16 @@ Then in Discord:
   - [x] auto-track on `/link` (`history.track`) to seed the tracked set
   - _rate limiting / cost caps intentionally skipped — small trusted server on the owner's key_
 - [x] **Cleanup** — `official_bs.py` folded onto `bs_client` (single Supercell token, shared slimming)
-- [ ] **Phase 5** — conversational threads
+- [ ] **Phase 5** — conversational threads & rich output
+  - [x] rich embeds for structured output — the agent finishes by calling a
+    terminal `present_answer` tool (defined in `agent.py`, intercepted by the
+    loop) that returns a structured `Answer` (title, summary, stat fields, image,
+    thumbnail, color); `bot._build_embed` renders it as a Discord embed. Images
+    flow from tool data: map `imageUrl`, player `iconUrl` (`slim_player`), and
+    brawler `imageUrl` (BrawlAPI) — the model only ever uses URLs it saw in tool
+    results, never invented ones. Falls back to plain-text chunks if the model
+    skips the tool or Discord rejects the embed.
   - [ ] multi-turn follow-ups in a Discord thread (agent is stateless today)
-  - [ ] rich embeds for structured output
 
 ## License
 

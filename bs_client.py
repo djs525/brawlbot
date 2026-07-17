@@ -60,6 +60,7 @@ async def get_events() -> list[dict]:
     for slot in data:
         ev = slot.get("event", {})
         out.append({"mode": ev.get("mode"), "map": ev.get("map"),
+                    "startTime": slot.get("startTime"),
                     "endTime": slot.get("endTime")})
     return out
 

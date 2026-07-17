@@ -17,12 +17,18 @@ import plugins
 
 @dataclass
 class Answer:
-    """Structured result the bot renders as a Discord embed.
+    """One embed view. The bot renders it as a Discord embed.
 
     Only `summary` is required; everything else is optional decoration. When the
     model finishes with plain prose instead of calling present_answer, we wrap
     that text as `summary` and leave the rest empty — the embed degrades to a
     plain description, so nothing downstream has to special-case it.
+
+    `tabs` holds alternate views of the SAME answer (e.g. Overview / By Mode /
+    By Brawler). When present, the bot renders one button per view and swaps the
+    embed on click — no re-query, the model already had all the data. Each tab is
+    itself an Answer (its own summary/fields/images), distinguished by `label`
+    (the button text). Tabs never nest — a tab's own `tabs` is ignored.
     """
     summary: str
     title: str | None = None
@@ -30,6 +36,8 @@ class Answer:
     image_url: str | None = None      # big banner image (maps)
     thumbnail_url: str | None = None  # small corner image (player icon / brawler)
     color: str | None = None          # hex like "#00b0f4"
+    label: str | None = None          # button text when this Answer is a tab
+    tabs: list["Answer"] = field(default_factory=list)
 
 SYSTEM = """You are a Brawl Stars analytics assistant embedded in a Discord bot.
 You answer questions about a player's profile, recent battles, long-term history,
@@ -49,6 +57,13 @@ Domain notes:
   report those numbers directly — do NOT re-aggregate the battle list by hand.
 - Each battle's "brawler" field is the brawler THIS player used. Never infer or
   guess a brawler; if the field is absent, say so rather than naming one.
+- The event rotation is LIVE-NOW ONLY — there is no data source for upcoming,
+  next, or tomorrow's maps. If asked about a future map ("next Basket Brawl map",
+  "tomorrow's rotation"), say plainly that you can only see the CURRENT rotation
+  and cannot see future maps — NEVER invent a map name. You may still give
+  mode-generic advice (e.g. good pushers for Basket Brawl as a mode) and apply
+  roster filters (P11, under 1000 trophies), just without tying it to an unseen
+  future map.
 
 The first message contains "asker_tag" — the questioner's own player tag.
 When they say "me"/"my", use that tag.
@@ -70,7 +85,15 @@ renders a rich Discord embed. Guidelines:
   answers, or a brawler's `imageUrl` when the answer is about one brawler.
 - Only ever use image URLs that appeared in tool results — never invent one.
 - `color`: optional hex accent, e.g. "#f5c518" for trophies, "#e84d4d" for
-  warnings/tilt, "#4da3ff" for neutral info."""
+  warnings/tilt, "#4da3ff" for neutral info.
+- `tabs`: optional. When an answer has natural alternate cuts of the SAME data,
+  add tabs and the bot shows a button per view. The top-level summary/fields is
+  the default "Overview" view; each tab is an additional view with its own
+  `label` (button text, 1-2 words), `summary`, and optional `fields`/images.
+  Good uses: battlelog/history → tabs "By Mode" and "By Brawler" (one field per
+  mode / per brawler); profile → tabs "Top Brawlers" and "Victories". Keep it to
+  at most 3 tabs. Skip tabs entirely for simple, single-cut answers (one map,
+  one brawler, a yes/no)."""
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
@@ -115,6 +138,32 @@ async def _generate(contents, config):
     raise last_err
 
 
+# Properties shared by the top-level answer and each tab (one embed view).
+_VIEW_PROPS = {
+    "summary": {"type": "string", "description": "The prose answer (<1800 chars)."},
+    "title": {"type": "string", "description": "Short headline for the card."},
+    "fields": {
+        "type": "array",
+        "description": "Stat rows. Prefer these over bullet lists.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Short label."},
+                "value": {"type": "string", "description": "Compact value."},
+                "inline": {"type": "boolean",
+                           "description": "true = sit side by side."},
+            },
+            "required": ["name", "value"],
+        },
+    },
+    "image_url": {"type": "string",
+                  "description": "Large banner image (a map's imageUrl)."},
+    "thumbnail_url": {"type": "string",
+                      "description": "Small corner image (player iconUrl or "
+                                     "brawler imageUrl)."},
+    "color": {"type": "string", "description": "Hex accent, e.g. '#f5c518'."},
+}
+
 # Terminal presentation tool. It is NOT a plugin — it fetches nothing. When the
 # model calls it, the loop intercepts the args and turns them into an Answer /
 # Discord embed, then stops. Keeping it here (not in plugins/) means it never
@@ -129,29 +178,24 @@ PRESENT_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "summary": {"type": "string",
-                        "description": "The prose answer (<1800 chars)."},
-            "title": {"type": "string", "description": "Short headline for the card."},
-            "fields": {
+            **_VIEW_PROPS,
+            "tabs": {
                 "type": "array",
-                "description": "Stat rows. Prefer these over bullet lists.",
+                "description": (
+                    "Optional alternate views of the SAME answer, shown as "
+                    "clickable buttons (e.g. 'By Mode', 'By Brawler'). The "
+                    "top-level view above is the default 'Overview'. At most 3 tabs."
+                ),
                 "items": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Short label."},
-                        "value": {"type": "string", "description": "Compact value."},
-                        "inline": {"type": "boolean",
-                                   "description": "true = sit side by side."},
+                        "label": {"type": "string",
+                                  "description": "Button text, 1-2 words."},
+                        **_VIEW_PROPS,
                     },
-                    "required": ["name", "value"],
+                    "required": ["label", "summary"],
                 },
             },
-            "image_url": {"type": "string",
-                          "description": "Large banner image (a map's imageUrl)."},
-            "thumbnail_url": {"type": "string",
-                              "description": "Small corner image (player iconUrl or "
-                                             "brawler imageUrl)."},
-            "color": {"type": "string", "description": "Hex accent, e.g. '#f5c518'."},
         },
         "required": ["summary"],
     },
@@ -164,8 +208,9 @@ def _valid_url(u) -> str | None:
     return u if isinstance(u, str) and u.startswith(("http://", "https://")) else None
 
 
-def _build_answer(args: dict) -> Answer:
-    """Coerce present_answer's raw tool args into a validated Answer."""
+def _view_from_args(args: dict, label: str | None = None) -> Answer:
+    """Coerce one view's raw args (top-level or a tab) into a validated Answer.
+    Does NOT read `tabs` — nesting is handled by the caller so tabs stay flat."""
     raw_fields = args.get("fields") or []
     fields = [
         {"name": str(f["name"])[:256],
@@ -182,7 +227,19 @@ def _build_answer(args: dict) -> Answer:
         image_url=_valid_url(args.get("image_url")),
         thumbnail_url=_valid_url(args.get("thumbnail_url")),
         color=(str(args["color"]) if args.get("color") else None),
+        label=(str(label)[:80] if label else None),
     )
+
+
+def _build_answer(args: dict) -> Answer:
+    """Coerce present_answer's raw tool args into a validated Answer, including
+    up to 3 alternate tab views. A tab needs both a label and a summary; malformed
+    tabs are skipped. Tabs never nest — a tab's own `tabs`, if any, is ignored."""
+    answer = _view_from_args(args)
+    for t in (args.get("tabs") or [])[:3]:
+        if isinstance(t, dict) and t.get("label") and t.get("summary"):
+            answer.tabs.append(_view_from_args(t, label=t["label"]))
+    return answer
 
 
 def _gemini_tool() -> types.Tool:

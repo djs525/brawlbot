@@ -151,13 +151,82 @@ def _build_embed(ans: Answer) -> discord.Embed:
     return embed
 
 
+class TabView(discord.ui.View):
+    """Buttons that swap between an answer's alternate views (Overview / By Mode
+    / …). All views are pre-rendered embeds — a click just edits the message to
+    show a different one, so there is no re-query and no LLM/API cost. Only the
+    original asker can click; buttons disable themselves on timeout."""
+
+    # Buttons stop working after this many seconds of no interaction (Discord
+    # gives no signal, so we time out and grey the buttons out ourselves).
+    TIMEOUT = 300
+
+    def __init__(self, embeds: list[discord.Embed], labels: list[str],
+                 author_id: int):
+        super().__init__(timeout=self.TIMEOUT)
+        self.embeds = embeds
+        self.author_id = author_id
+        self.message: discord.Message | None = None  # set by caller after send
+        self.active = 0
+        for i, label in enumerate(labels):
+            self.add_item(self._make_button(i, label))
+
+    def _make_button(self, index: int, label: str) -> discord.ui.Button:
+        btn = discord.ui.Button(label=(label or f"View {index + 1}")[:80],
+                                style=self._style(index), row=0)
+
+        async def callback(interaction: discord.Interaction):
+            self.active = index
+            for i, item in enumerate(self.children):
+                item.style = self._style(i)  # highlight the active tab
+            await interaction.response.edit_message(
+                embed=self.embeds[index], view=self)
+
+        btn.callback = callback
+        return btn
+
+    def _style(self, index: int) -> discord.ButtonStyle:
+        return (discord.ButtonStyle.primary if index == self.active
+                else discord.ButtonStyle.secondary)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "This card isn't yours — run `/ask` to get your own.",
+                ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass  # message deleted / too old to edit — nothing to do
+
+
 async def _send_answer(interaction: discord.Interaction, ans: Answer) -> None:
-    """Send an Answer as a rich embed, spilling any over-4096-char summary tail
-    into plain follow-ups. If Discord rejects the embed (e.g. total size over
-    its 6000-char ceiling), fall back to plain-text chunks so the user still
-    gets the answer instead of nothing."""
+    """Send an Answer as a rich embed. If it carries tabs, attach a TabView whose
+    buttons swap between the pre-rendered views. Any over-4096-char summary tail
+    on the default view spills into plain follow-ups. If Discord rejects the
+    embed (e.g. total size over its 6000-char ceiling), fall back to plain-text
+    chunks so the user still gets the answer instead of nothing."""
     try:
-        await interaction.followup.send(embed=_build_embed(ans))
+        embeds = [_build_embed(ans)]
+        labels = ["Overview"]
+        for tab in ans.tabs:
+            embeds.append(_build_embed(tab))
+            labels.append(tab.label or f"View {len(labels) + 1}")
+
+        if len(embeds) == 1:
+            await interaction.followup.send(embed=embeds[0])
+        else:
+            view = TabView(embeds, labels, author_id=interaction.user.id)
+            view.message = await interaction.followup.send(
+                embed=embeds[0], view=view)
+
         overflow = (ans.summary.strip() or "")[4096:]
         if overflow.strip():
             for chunk in _chunk(overflow):

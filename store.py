@@ -38,6 +38,16 @@ def get_tag(discord_id:str) -> str | None:
     return row[0] if row else None
 
 
+def all_links() -> dict[str, str]:
+    """Reverse map: player_tag -> discord_id. Lets the recap poller find who
+    owns a tracked tag (to @mention them) and scope recaps to linked players
+    only. If two Discord accounts linked the same tag, last one wins — fine for
+    a friend group."""
+    with _conn() as c:
+        rows = c.execute("SELECT player_tag, discord_id FROM links").fetchall()
+    return {tag: did for tag, did in rows}
+
+
 VALID_TAG_CHARS = set("0289PYLQGRJCUV")  # Supercell's alphabet
 def normalize_tag(raw: str) -> str:
     """Return a canonical '#ABC123' tag, or raise ValueError."""

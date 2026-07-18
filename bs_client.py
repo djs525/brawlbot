@@ -172,13 +172,18 @@ def outcome(mode: str | None, result: str | None, rank: int | None) -> str | Non
     return None
 
 
-def summarize_battles(battles: list[dict]) -> dict:
-    """Pre-computed overall / per-mode / per-brawler tallies over a battle list.
+def is_ranked(battle: dict) -> bool:
+    """True if this battle is a competitive Ranked (ex-Power League) game.
 
-    Same reason slim_player ships power11Count: the model mis-aggregates a
-    25-row list by hand (it merged soloShowdown into duoShowdown on a shared
-    map). Each battle is a dict with mode/brawler/result/rank/trophyChange.
-    """
+    The API's `type` field is confusingly named: trophy-ladder games carry
+    type "ranked", while the competitive Ranked mode carries "soloRanked".
+    Anything not "soloRanked" (including a missing type on pre-migration stored
+    rows) counts as a trophy game — the safe majority default."""
+    return (battle.get("type") or "").lower() == "soloranked"
+
+
+def _tally(battles: list[dict]) -> dict:
+    """overall / per-mode / per-brawler buckets over one battle list."""
     def bucket():
         return {"battles": 0, "wins": 0, "losses": 0, "trophyChange": 0}
 
@@ -206,6 +211,26 @@ def summarize_battles(battles: list[dict]) -> dict:
     return {"overall": finalize(overall),
             "perMode": {k: finalize(v) for k, v in per_mode.items()},
             "perBrawler": {k: finalize(v) for k, v in per_brawler.items()}}
+
+
+def summarize_battles(battles: list[dict]) -> dict:
+    """Pre-computed overall / per-mode / per-brawler tallies over a battle list.
+
+    Same reason slim_player ships power11Count: the model mis-aggregates a
+    25-row list by hand (it merged soloShowdown into duoShowdown on a shared
+    map). Each battle is a dict with mode/brawler/result/rank/trophyChange, and
+    optionally `type` (see is_ranked).
+
+    Trophy-ladder and competitive-Ranked games are fundamentally different
+    (Ranked has no trophyChange, so mixing them dilutes win rates and means
+    nothing for trophy swing). The top-level keys stay COMBINED for backward
+    compatibility; `trophy` and `ranked` hold the same shape split by type, so
+    callers that care can report them separately."""
+    trophy = [b for b in battles if not is_ranked(b)]
+    ranked = [b for b in battles if is_ranked(b)]
+    return {**_tally(battles),
+            "trophy": _tally(trophy),
+            "ranked": _tally(ranked)}
 
 
 def slim_battlelog(data: dict, tag: str) -> list[dict]:

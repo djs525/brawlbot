@@ -11,7 +11,11 @@ On every query_history call we:
 
 Schema (pre-existing history.db):
   tracked(tag, added_at)
-  battles(tag, battle_time, mode, map, brawler, result, rank, trophy_change)
+  battles(tag, battle_time, mode, map, brawler, result, rank, trophy_change, type)
+
+`type` (added by _migrate) distinguishes trophy-ladder games from competitive
+Ranked — see bs_client.is_ranked. Rows stored before the migration have
+type=NULL and count as trophy games.
 """
 
 import json
@@ -60,6 +64,16 @@ def _conn():
     return sqlite3.connect(DB_PATH)
 
 
+def _migrate() -> None:
+    """Add the `type` column to an old battles table. Idempotent — a second run
+    hits 'duplicate column name' and is ignored. Safe to call every import."""
+    try:
+        with _conn() as c:
+            c.execute("ALTER TABLE battles ADD COLUMN type TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists, or table not created yet (first run)
+
+
 def track(tag: str) -> None:
     """Add a tag to the tracked set so the background poller snapshots it.
     Idempotent — re-tracking an existing tag is a no-op."""
@@ -91,6 +105,7 @@ def record_battles(tag: str, battlelog: dict) -> int:
             b.get("result"),
             b.get("rank"),
             b.get("trophyChange"),
+            b.get("type"),
         ))
     if not rows:
         return 0
@@ -100,8 +115,8 @@ def record_battles(tag: str, battlelog: dict) -> int:
                   (tag, datetime.now(timezone.utc).strftime(_TIME_FMT)))
         c.executemany(
             "INSERT OR IGNORE INTO battles "
-            "(tag, battle_time, mode, map, brawler, result, rank, trophy_change) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(tag, battle_time, mode, map, brawler, result, rank, trophy_change, type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         return c.total_changes - before
@@ -112,7 +127,7 @@ def query_history(tag: str, days: int = 30) -> dict:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(_TIME_FMT)
     with _conn() as c:
         rows = c.execute(
-            "SELECT mode, brawler, result, rank, trophy_change FROM battles "
+            "SELECT mode, brawler, result, rank, trophy_change, type FROM battles "
             "WHERE tag = ? AND battle_time >= ?",
             (tag, cutoff),
         ).fetchall()
@@ -124,11 +139,14 @@ def query_history(tag: str, days: int = 30) -> dict:
 
     summary = bs_client.summarize_battles([
         {"mode": mode, "brawler": brawler, "result": result,
-         "rank": rank, "trophyChange": trophy}
-        for mode, brawler, result, rank, trophy in rows
+         "rank": rank, "trophyChange": trophy, "type": btype}
+        for mode, brawler, result, rank, trophy, btype in rows
     ])
     return {"tag": tag, "days": days,
             "battles": summary["overall"]["battles"], **summary}
+
+
+_migrate()  # bring an old battles table up to the current schema on import
 
 
 async def execute(name: str, tool_input: dict) -> str:

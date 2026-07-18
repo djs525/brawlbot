@@ -55,6 +55,11 @@ Domain notes:
   overall/perMode/perBrawler tallies (battles, wins, losses, trophyChange,
   winRate). For "how did I do on X" / "breakdown by brawler or mode" questions,
   report those numbers directly — do NOT re-aggregate the battle list by hand.
+  The summary ALSO splits the same tallies into `trophy` and `ranked` keys
+  (competitive Ranked / ex-Power League). These are different games: Ranked has
+  no trophyChange, so mixing them muddies win rates. Report them separately when
+  the player asks about "ranked" vs "trophies", or when both are present and it
+  aids clarity. `overall` stays the combined view.
 - Each battle's "brawler" field is the brawler THIS player used. Never infer or
   guess a brawler; if the field is absent, say so rather than naming one.
 - get_event_rotation returns 'rotation' (LIVE-NOW maps) and sometimes 'upcoming'

@@ -12,6 +12,7 @@ from discord.ext import tasks
 
 from agent import answer_question, Answer
 import bs_client
+import recap
 from plugins import history
 import plugins
 
@@ -28,6 +29,10 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)  # holds our slash commands
 store.init()
+recap.init()  # session-recap watermark table
+
+# Channel the bot posts session recaps into. Override with BS_CHANNEL in .env.
+RECAP_CHANNEL = os.getenv("BS_CHANNEL", "bs")
 
 # How often the poller snapshots each tracked player's battlelog. The official
 # API only keeps ~25 battles, so this must stay well under the time a player
@@ -35,24 +40,65 @@ store.init()
 POLL_MINUTES = 20
 
 
-async def _snapshot(tag: str) -> None:
-    """Record one player's recent battles into history.db. Best-effort — a
-    failure is logged, never raised (used from the poller and from /link)."""
+async def _snapshot(tag: str) -> int:
+    """Record one player's recent battles into history.db. Returns the number of
+    newly stored battles (0 on any failure). Best-effort — a failure is logged,
+    never raised (used from the poller and from /link)."""
     try:
         new = history.record_battles(tag, await bs_client.get_battlelog(tag))
         if new:
             print(f"snapshot: {tag} +{new} new battle(s)")
+        return new
     except Exception as e:
         print(f"snapshot: {tag} failed: {type(e).__name__}: {e}")
+        return 0
+
+
+def _recap_channel() -> discord.TextChannel | None:
+    """First text channel named RECAP_CHANNEL the bot can post in, across all
+    guilds it's in. None if not found (recaps are then silently skipped)."""
+    for guild in client.guilds:
+        ch = discord.utils.get(guild.text_channels, name=RECAP_CHANNEL)
+        if ch and ch.permissions_for(guild.me).send_messages:
+            return ch
+    return None
+
+
+async def _post_recap(tag: str, new: int, links: dict[str, str]) -> None:
+    """If a linked player just finished a session, post their recap to #bs."""
+    discord_id = links.get(tag)
+    if discord_id is None:
+        return  # not a linked player — recaps are opt-in via /link
+    try:
+        embed = await recap.maybe_recap(tag, new, discord_id)
+    except Exception as e:
+        print(f"recap: build failed for {tag}: {type(e).__name__}: {e}")
+        return
+    if embed is None:
+        return
+    channel = _recap_channel()
+    if channel is None:
+        print(f"recap: no #{RECAP_CHANNEL} channel found; skipping {tag}")
+        return
+    try:
+        await channel.send(content=f"<@{discord_id}>", embed=embed)
+        print(f"recap: posted session recap for {tag}")
+    except discord.HTTPException as e:
+        print(f"recap: failed to post for {tag}: {e}")
 
 
 @tasks.loop(minutes=POLL_MINUTES)
 async def poll_history():
     """Snapshot every tracked player's recent battles into history.db so we can
     answer longer-window questions than the ~25-battle API log allows. Dedup is
-    handled by record_battles (INSERT OR IGNORE); one bad tag can't kill the loop."""
+    handled by record_battles (INSERT OR IGNORE); one bad tag can't kill the loop.
+
+    Doubles as the session-recap trigger: after snapshotting a linked player,
+    a quiet tick (no new battles) with un-recapped recent games posts a recap."""
+    links = store.all_links()  # tag -> discord_id, snapshot once per tick
     for tag in history.tracked_tags():
-        await _snapshot(tag)
+        new = await _snapshot(tag)
+        await _post_recap(tag, new, links)
 
 
 @poll_history.before_loop
@@ -119,6 +165,44 @@ async def link(interaction: discord.Interaction, tag: str):
         f"✅ Linked to `{clean}`. Try `/ask what are my best brawlers?`",
         ephemeral=True,
     )
+
+@tree.command(name="recap", description="Post your recent session recap to the #bs channel now")
+@app_commands.describe(hours="How far back to look, in hours (default 2, max 168)")
+async def recap_cmd(interaction: discord.Interaction,
+                    hours: int = recap.RECAP_WINDOW_HOURS):
+    # Ephemeral defer: the confirmation is private; the recap itself goes to #bs.
+    await interaction.response.defer(ephemeral=True)
+    tag = store.get_tag(str(interaction.user.id))
+    if not tag:
+        await interaction.followup.send(
+            "❌ Link a tag first: `/link <your #tag>`.", ephemeral=True)
+        return
+
+    await _snapshot(tag)  # pull latest games so the recap includes them
+    hours = max(1, min(hours, 168))  # clamp to 1h..7d
+    rows = recap.recent_session(tag, hours)
+    if not rows:
+        await interaction.followup.send(
+            f"No battles found for `{tag}` in the last {hours}h — play some "
+            f"games first, or widen the window with `/recap hours:24`.",
+            ephemeral=True)
+        return
+
+    channel = _recap_channel()
+    if channel is None:
+        await interaction.followup.send(
+            f"❌ I can't find a #{RECAP_CHANNEL} channel I'm allowed to post in. "
+            f"Check the channel name and my permissions.", ephemeral=True)
+        return
+
+    embed = await recap.render(tag, rows, str(interaction.user.id))
+    try:
+        await channel.send(content=f"<@{interaction.user.id}>", embed=embed)
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"❌ Failed to post: `{e}`.", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"✅ Posted your recap to {channel.mention}.", ephemeral=True)
 
 DEFAULT_COLOR = 0x4DA3FF  # neutral blue accent when the model gives no color
 

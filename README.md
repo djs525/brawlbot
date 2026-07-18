@@ -11,6 +11,7 @@ An AI-powered Brawl Stars analyst that lives in your Discord server. Link your p
 - Trophy, win-rate, and brawler performance analysis from your recent battles
 - Longitudinal history beyond the ~25-battle API window, stored locally in SQLite
 - Event rotation and map-aware pick suggestions (via BrawlAPI/Brawlify metadata)
+- **Proactive session recaps** — when a linked player finishes a play session, the bot posts a deterministic recap (record, net trophies, brawlers, standout) to your `#bs` channel. No `/ask` needed — the history poller detects the session and pushes.
 - **Plugin architecture** — new data sources are drop-in files; the agent core never changes
 
 ## Why this works
@@ -51,6 +52,7 @@ brawlbot/
 ├── agent.py      # LLM agent loop: source-agnostic, never changes when adding data
 ├── plugins/      # each file = one data source exposing TOOLS + async execute()
 ├── bs_client.py  # async Supercell API wrapper + slim_* payload trimmers
+├── recap.py      # proactive session recaps: session detection + embed (rides the poller)
 ├── store.py      # SQLite storage (linked tags), tag normalization
 ├── brawlbot.db   # links DB, created automatically on first run
 ├── history.db    # tracked players + battle history

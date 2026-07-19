@@ -12,7 +12,10 @@ An AI-powered Brawl Stars analyst that lives in your Discord server. Link your p
 - Longitudinal history beyond the ~25-battle API window, stored locally in SQLite
 - Event rotation and map-aware pick suggestions (via BrawlAPI/Brawlify metadata)
 - **Proactive session recaps** — when a linked player finishes a play session, the bot posts a deterministic recap (record, net trophies, brawlers, standout) to your `#bs` channel. No `/ask` needed — the history poller detects the session and pushes.
+- **`/recap [hours]`** — post your recent session recap to `#bs` on demand (default 2h window, max 7 days)
+- **`/team-comp [map] [days] [ranked_only] [squad_only]`** — best duo/3v3 line-ups you and your linked friends have *actually run*, ranked by real win rate from stored history; also available to `/ask` as the `team_comps` tool
 - **Plugin architecture** — new data sources are drop-in files; the agent core never changes
+- **Eval harness** (`evals/`) — unit + agent suites that gate prompt/model/data-layer changes; see [evals/README.md](evals/README.md)
 
 ## Why this works
 
@@ -37,7 +40,9 @@ Discord slash command (/ask)
   ├── brawlapi.py      # BrawlAPI: get_map_details (map images, no key)
   ├── brawlers.py      # Supercell catalog: get_brawlers
   ├── rankings.py      # Supercell leaderboards: get_rankings
-  └── history.py       # local longitudinal history: query_history (SQLite)
+  ├── history.py       # local longitudinal history: query_history (SQLite)
+  ├── teamcomp.py      # team-comp win rates from stored history: team_comps
+  └── jsonout.py       # shared JSON serializer (not a plugin — no TOOLS)
         ▼
   SQLite
   ├── brawlbot.db (store.py)   # linked tags, tag normalization
@@ -54,6 +59,7 @@ brawlbot/
 ├── bs_client.py  # async Supercell API wrapper + slim_* payload trimmers
 ├── recap.py      # proactive session recaps: session detection + embed (rides the poller)
 ├── store.py      # SQLite storage (linked tags), tag normalization
+├── evals/        # eval harness: unit suite (pure data layer) + agent suite (live Gemini, fixture tools)
 ├── brawlbot.db   # links DB, created automatically on first run
 ├── history.db    # tracked players + battle history
 └── .env          # secrets (never commit this)
@@ -116,7 +122,20 @@ Then in Discord:
 /ask what are my best brawlers?
 /ask what should I push on today's maps?
 /ask how's my win rate in showdown this month?
+/team-comp map:Hard Rock Mine
 ```
+
+## Evals
+
+Run before shipping any prompt, model, or data-layer change:
+
+```bash
+python -m evals.run                  # both suites
+python -m evals.run --suite unit     # free, no keys, <1s — data layer only
+python -m evals.run --suite agent    # live Gemini, fixture data tools
+```
+
+Details in [evals/README.md](evals/README.md).
 
 ## Implementation notes & gotchas
 
@@ -124,9 +143,10 @@ Then in Discord:
 - **Always send a followup** — after a `defer()`, a crash with no followup leaves the user staring at "thinking…" forever; agent calls are wrapped in try/except.
 - **2000-character cap** — Discord hard-rejects longer messages; `bot._chunk` splits answers on line boundaries into ≤2000-char messages.
 - **Env-load order** — `load_dotenv()` must run before `plugins.load_plugins()` in `bot.py`, since plugins read `os.environ` at import time. Tools are also built at *call* time, not import time, because `agent` is imported before the registry is loaded.
-- **Payload trimming** — `bs_client.slim_*` helpers cut fat API payloads down to what the LLM needs; plugins additionally cap raw responses at 12000 chars to stay inside free-tier token limits.
+- **Payload trimming** — `bs_client.slim_*` helpers cut fat API payloads down to what the LLM needs. Size capping goes through `plugins/jsonout.dump` (12000-char ceiling): it drops whole trailing list items and says so, instead of a raw character slice that would hand the model malformed JSON to hallucinate from.
 - **Showdown scoring** — showdown reports placement, not victory/defeat. `history.py` scores solo (top 4) and duo/trio (top 2) as wins when aggregating win rates.
 - **Battle log retention** — the API only keeps ~25 battles. A background poller (`bot.poll_history`, every 20 min) snapshots every tracked player's battlelog into `history.db`, so longer windows can be queried. Players are enrolled by `/link` (`history.track`); `query_history` also records the caller's battles on demand. `record_battles` dedupes on `(tag, battle_time)`, so overlapping snapshots are harmless.
+- **Team-comp bookkeeping** — each stored battle also records `team` (the brawler line-up on the player's own team, sorted so a comp is order-independent) and `team_tags` (who played it). A squad game shows up once per tracked friend, so `teamcomp.best_comps` dedupes on `(battle_time, comp, result)` before tallying; comps under 3 games are hidden as noise. Solo modes have no team and never become comps.
 
 ## Roadmap
 
@@ -140,6 +160,8 @@ Then in Discord:
   - [x] auto-track on `/link` (`history.track`) to seed the tracked set
   - _rate limiting / cost caps intentionally skipped — small trusted server on the owner's key_
 - [x] **Cleanup** — `official_bs.py` folded onto `bs_client` (single Supercell token, shared slimming)
+- [x] **Eval harness** — `evals/` unit + agent suites (`python -m evals.run`); agent cases hit live Gemini with fixture data tools, so failures are prompt/model regressions, never upstream flake
+- [x] **Team comps** — `/team-comp` command + `team_comps` LLM tool: per-map duo/3v3 line-up win rates pooled across all linked players, with ranked-only and squad-only filters
 - [ ] **Phase 5** — conversational threads & rich output
   - [x] rich embeds for structured output — the agent finishes by calling a
     terminal `present_answer` tool (defined in `agent.py`, intercepted by the

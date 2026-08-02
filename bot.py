@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import store
 from store import normalize_tag
 from dotenv import load_dotenv
@@ -203,6 +204,105 @@ async def recap_cmd(interaction: discord.Interaction,
         return
     await interaction.followup.send(
         f"✅ Posted your recap to {channel.mention}.", ephemeral=True)
+
+def _pretty_mode(mode: str | None) -> str:
+    """'brawlBall' -> 'Brawl Ball', 'soloRanked' -> 'Solo Ranked'."""
+    if not mode:
+        return ""
+    words = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", mode)
+    return " ".join(w[:1].upper() + w[1:] for w in words.split())
+
+
+def _fmt_comp(c: dict) -> str:
+    """One comp as a compact line: 'Poco + Gene + Tara — 71% (10W-4L · 14g)'.
+    Brawlers played by a linked friend get their mention appended, e.g.
+    'Poco (<@123>) + Gene + Tara — ...', so squad comps show who ran what."""
+    played_by = c.get("playedBy") or {}
+    parts = [f"{name} (<@{played_by[name]}>)" if name in played_by else name
+             for name in c["brawlers"]]
+    brawlers = " + ".join(parts)
+    return (f"**{brawlers}** — {c['winRate']}% "
+            f"({c['wins']}W-{c['losses']}L · {c['games']}g)")
+
+
+def _team_comp_embed(data: dict, scope_note: str) -> discord.Embed:
+    """Render best_comps() output as an embed. One line per comp; when no map was
+    given, comps are grouped under a field per map so each map's best line-ups
+    read cleanly."""
+    resolved = data.get("map")
+    if resolved:
+        mode = _pretty_mode(data.get("mode"))
+        title = f"Best team comps — {resolved}" + (f" ({mode})" if mode else "")
+    else:
+        title = "Best team comps (all maps)"
+    comps = data.get("comps", [])
+
+    if not comps:
+        return discord.Embed(
+            title=title, color=0xE8A24D,
+            description=data.get("note", "No comps to show yet."))
+
+    embed = discord.Embed(title=title, color=0x4DA3FF)
+    embed.set_footer(text="BrawlBot • win rates from games you actually played")
+
+    if resolved:
+        # Single map: a ranked list, top comps first.
+        lines = [f"{i}. {_fmt_comp(c)}" for i, c in enumerate(comps[:10], 1)]
+        embed.description = f"{scope_note}\n\n" + "\n".join(lines)
+    else:
+        # All maps: best comp(s) per map, one field each (Discord caps at 25).
+        embed.description = scope_note
+        by_map: dict[str, list[dict]] = {}
+        for c in comps:
+            by_map.setdefault(c.get("map") or "Unknown", []).append(c)
+        for m in sorted(by_map, key=lambda k: by_map[k][0]["winRate"], reverse=True)[:25]:
+            top = by_map[m][:3]
+            mode = _pretty_mode(top[0].get("mode"))
+            embed.add_field(name=f"{m} · {mode}" if mode else m,
+                            value="\n".join(_fmt_comp(c) for c in top),
+                            inline=False)
+    return embed
+
+
+@tree.command(name="team-comp",
+              description="Best team comps you & your friends have run, by win rate")
+@app_commands.describe(
+    map="Map to focus on (optional; omit for your best comps on every map)",
+    days="Look-back window in days (default 30, max 365)",
+    ranked_only="Only count competitive Ranked games",
+    squad_only="Only games where 2+ linked friends were on the same team")
+async def team_comp_cmd(interaction: discord.Interaction, map: str | None = None,
+                        days: int = 30, ranked_only: bool = False,
+                        squad_only: bool = False):
+    await interaction.response.defer()
+    tag = store.get_tag(str(interaction.user.id))
+    if not tag:
+        await interaction.followup.send(
+            "❌ Link a tag first: `/link <your #tag>`.", ephemeral=True)
+        return
+
+    await _snapshot(tag)  # pull the asker's latest games so this session counts
+    days = max(1, min(days, 365))
+
+    # Player-scoped by default — only the asker's own comps. squad_only opts
+    # into pooling the whole linked friend group (shared squad games dedupe
+    # inside best_comps, so pooling never double-counts).
+    from plugins import teamcomp
+    tags = list(store.all_links().keys()) if squad_only else [tag]
+    min_games = 1 if ranked_only else teamcomp.MIN_GAMES
+    data = teamcomp.best_comps(tags, map_name=map, days=days, min_games=min_games,
+                               ranked_only=ranked_only, together_only=squad_only)
+
+    pool = "your" if len(tags) == 1 else f"{len(tags)} linked players'"
+    scope = (f"Pooled from {pool} games · last {days}d"
+             + (" · Ranked only" if ranked_only else "")
+             + (" · squad games only" if squad_only else ""))
+    try:
+        await interaction.followup.send(embed=_team_comp_embed(data, scope))
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"❌ Failed to render comps: `{e}`.",
+                                        ephemeral=True)
+
 
 DEFAULT_COLOR = 0x4DA3FF  # neutral blue accent when the model gives no color
 

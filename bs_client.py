@@ -151,6 +151,58 @@ def player_brawler(battle: dict, tag: str) -> str | None:
     return None
 
 
+def player_team(battle: dict, tag: str) -> list[str] | None:
+    """The full brawler line-up on `tag`'s own team for one battle, sorted by
+    name (a comp is order-independent, so sorting canonicalises it for grouping).
+    Includes the player themself. Returns None when there's no real team — solo
+    modes, or a battle where the player isn't found — so callers can skip games
+    that have no composition to speak of. Duo (2) and 3v3 (3) both qualify.
+
+    Only the `teams` structure counts: the flat `players` list (solo showdown's
+    shape) is 10 opponents, not a team, so it must never become a "comp"."""
+    want = _plain_tag(tag)
+    for group in battle.get("teams") or []:
+        if any(_plain_tag(p.get("tag", "")) == want for p in group):
+            if len(group) < 2:
+                return None
+            names = [(p.get("brawler") or {}).get("name") for p in group]
+            return sorted(n for n in names if n)  # drop any missing brawler
+    return None
+
+
+def player_team_tags(battle: dict, tag: str) -> list[str] | None:
+    """The player TAGS on `tag`'s own team (including the player), sorted. Pairs
+    with player_team's brawler list: player_team says WHAT was played, this says
+    WHO played it — so we can tell a squad game (2+ linked friends on the team)
+    from a solo-queue game with random fill. None whenever player_team is None."""
+    want = _plain_tag(tag)
+    for group in battle.get("teams") or []:
+        if any(_plain_tag(p.get("tag", "")) == want for p in group):
+            if len(group) < 2:
+                return None
+            return sorted(_plain_tag(p.get("tag", "")) for p in group
+                          if p.get("tag"))
+    return None
+
+
+def player_team_pairs(battle: dict, tag: str) -> list[dict] | None:
+    """WHO played WHAT on `tag`'s own team, paired (unlike player_team and
+    player_team_tags, which are each sorted independently and so lose the
+    tag<->brawler pairing). Sorted by tag for a stable storage order. None
+    whenever player_team is None."""
+    want = _plain_tag(tag)
+    for group in battle.get("teams") or []:
+        if any(_plain_tag(p.get("tag", "")) == want for p in group):
+            if len(group) < 2:
+                return None
+            pairs = [{"tag": _plain_tag(p.get("tag", "")),
+                      "brawler": (p.get("brawler") or {}).get("name")}
+                     for p in group
+                     if p.get("tag") and (p.get("brawler") or {}).get("name")]
+            return sorted(pairs, key=lambda p: p["tag"])
+    return None
+
+
 def _rate(wins: int, total: int) -> float:
     return round(100 * wins / total, 1) if total else 0.0
 

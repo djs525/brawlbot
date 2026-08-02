@@ -65,13 +65,26 @@ def _conn():
 
 
 def _migrate() -> None:
-    """Add the `type` column to an old battles table. Idempotent — a second run
-    hits 'duplicate column name' and is ignored. Safe to call every import."""
-    try:
-        with _conn() as c:
-            c.execute("ALTER TABLE battles ADD COLUMN type TEXT")
-    except sqlite3.OperationalError:
-        pass  # column already exists, or table not created yet (first run)
+    """Bring an old battles table up to the current schema by adding any columns
+    it predates. Each ALTER is idempotent — a second run hits 'duplicate column
+    name' and is ignored. Safe to call every import.
+
+    `team` (JSON brawler list on THIS player's team) and `team_tags` (JSON of
+    those teammates' player tags) power the team-comp feature — the first says
+    WHAT was played, the second WHO played it, so squad games (2+ linked friends
+    on one team) are distinguishable from solo-queue-with-randoms. Rows stored
+    before this migration have team/team_tags=NULL and are invisible to comp
+    queries until the player is re-snapshotted.
+
+    `team_pairs` (JSON list of {tag, brawler}) pairs WHO with WHAT directly —
+    team/team_tags are each sorted independently, so their indices don't line
+    up. Powers per-brawler attribution ("who played what") for linked players."""
+    for col in ("type TEXT", "team TEXT", "team_tags TEXT", "team_pairs TEXT"):
+        try:
+            with _conn() as c:
+                c.execute(f"ALTER TABLE battles ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass  # column already exists, or table not created yet (first run)
 
 
 def track(tag: str) -> None:
@@ -96,6 +109,9 @@ def record_battles(tag: str, battlelog: dict) -> int:
     for item in battlelog.get("items", []):
         b = item.get("battle", {})
         ev = item.get("event", {})
+        team = bs_client.player_team(b, tag)          # brawlers (WHAT), None for solo
+        team_tags = bs_client.player_team_tags(b, tag)  # teammate tags (WHO)
+        team_pairs = bs_client.player_team_pairs(b, tag)  # WHO played WHAT, paired
         rows.append((
             tag,
             item.get("battleTime"),
@@ -106,6 +122,9 @@ def record_battles(tag: str, battlelog: dict) -> int:
             b.get("rank"),
             b.get("trophyChange"),
             b.get("type"),
+            json.dumps(team) if team else None,
+            json.dumps(team_tags) if team_tags else None,
+            json.dumps(team_pairs) if team_pairs else None,
         ))
     if not rows:
         return 0
@@ -115,11 +134,21 @@ def record_battles(tag: str, battlelog: dict) -> int:
                   (tag, datetime.now(timezone.utc).strftime(_TIME_FMT)))
         c.executemany(
             "INSERT OR IGNORE INTO battles "
-            "(tag, battle_time, mode, map, brawler, result, rank, trophy_change, type) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(tag, battle_time, mode, map, brawler, result, rank, trophy_change, type, team, team_tags, team_pairs) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
-        return c.total_changes - before
+        new = c.total_changes - before
+        # Backfill rows stored before the team/team_tags/team_pairs (or type)
+        # columns existed: INSERT OR IGNORE skips battles already seen, so
+        # without this a battle first recorded by older code would never gain
+        # its comp even while the battlelog still carries the data.
+        c.executemany(
+            "UPDATE battles SET team = ?, team_tags = ?, team_pairs = ?, type = COALESCE(type, ?) "
+            "WHERE tag = ? AND battle_time = ? AND team IS NULL",
+            [(r[9], r[10], r[11], r[8], r[0], r[1]) for r in rows if r[9]],
+        )
+        return new
 
 
 def query_history(tag: str, days: int = 30) -> dict:
